@@ -3,10 +3,9 @@ package framework
 import (
 	"context"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
-
-	yaml "gopkg.in/yaml.v2"
 
 	appv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -188,95 +187,123 @@ func DeleteCompletely(getObject func() (runtime.Object, error), deleteObject fun
 	})
 }
 
-func ConsoleResourcesAvailable(client *ClientSet) error {
+// atomicFailure supports reporting whether one or more of a set of goroutines
+// has a failure condition to report.
+type atomicFailure struct {
+	sync.Mutex
+	failed bool
+}
+
+func (a *atomicFailure) setFailed() {
+	a.Lock()
+	defer a.Unlock()
+	a.failed = true
+}
+
+func (a *atomicFailure) getFailed() bool {
+	a.Lock()
+	defer a.Unlock()
+	return a.failed
+}
+
+// CheckConsoleResourcesAvailable checks if the console resources are available
+// and stay that way for at least 30s.
+func CheckConsoleResourcesAvailable(t *testing.T, client *ClientSet) {
 	resources := getTestingResources()
 	// We have to test the `console-public` configmap in the TestManaged as well.
 	resources = append(resources, TestingResource{"ConfigMap", consoleapi.OpenShiftConsolePublicConfigMapName, consoleapi.OpenShiftConfigManagedNamespace})
 
-	errChan := make(chan error)
+	failed := atomicFailure{}
+	var wg sync.WaitGroup
 	for _, resource := range resources {
-		go IsResourceAvailable(errChan, client, resource)
+		wg.Add(1)
+		go func(resource TestingResource) {
+			if !IsResourceAvailable(t, client, resource) {
+				failed.setFailed()
+			}
+		}(resource)
 	}
-
-	checkErr := <-errChan
-	return checkErr
+	wg.Wait()
+	if failed.getFailed() {
+		t.Fatalf("One or more console resources did not stay available for at least 30s.")
+	}
 }
 
-// IsResourceAvailable checks if tested resource is available during a 30 second period.
-// if the resource does not exist by the end of the period, an error will be returned.
-func IsResourceAvailable(errChan chan error, client *ClientSet, resource TestingResource) {
-	counter := 0
-	maxCount := 30
+// IsResourceAvailable indicates whether the resource are available and stay
+// that way for at least 30s. Once a resource becomes available, it should not
+// go missing.
+func IsResourceAvailable(t *testing.T, client *ClientSet, resource TestingResource) bool {
+	startTime := time.Now()
+	minimumDuration := time.Second * 30
 	err := wait.Poll(1*time.Second, AsyncOperationTimeout, func() (stop bool, err error) {
 		_, err = GetResource(client, resource)
-		if err == nil {
-			return true, nil
+		if errors.IsNotFound(err) {
+			// Resource does not exist. Reset timer and keep waiting.
+			startTime = time.Now()
+			return false, nil
 		}
-		if counter == maxCount {
-			if err != nil {
-				return true, fmt.Errorf("deleted console %s %s was not recreated", resource.kind, resource.name)
-			}
-			return true, nil
+		if err != nil {
+			// Unable to retrieve resource due to error. Reset timer and keep waiting.
+			startTime = time.Now()
+			t.Errorf("Error checking that console %s %s exists: %v", resource.kind, resource.name, err)
+			return false, nil
 		}
-		counter++
-		return false, nil
+		minimumDurationElapsed := startTime.Add(minimumDuration).Before(time.Now())
+		return minimumDurationElapsed, nil
 	})
-	errChan <- err
-}
-
-// checks 3 times if the resources are unavailable
-// - is fine if fails or 1st or 2nd run, resources could be in the process of being removed
-// - is not fine if resources disappear, then reappear
-// - it seems to take a bit longer to remove resources, so this wrapper should account for that.
-func ConsoleResourcesUnavailable(client *ClientSet) error {
-	var failed error = nil
-	// give it 3 tries, then fail
-	for i := 0; i < 3; i++ {
-		// testing resources are hard-coded in this func.
-		err := LoopResources(client, IsResourceUnavailable)
-		fmt.Printf("validating console resources have been removed... %v\n", err == nil)
-		failed = err
+	if err != nil {
+		t.Errorf("Timed out waiting for console %s %s to exist for at least %v", resource.kind, resource.name, minimumDuration)
 	}
-	return failed
+	return err == nil
 }
 
-func LoopResources(client *ClientSet, inner func(errChan chan error, client *ClientSet, resource TestingResource)) error {
+// CheckConsoleResourcesUnavailable checks if the console resources go missing
+// and stay that way for at least 30s.
+func CheckConsoleResourcesUnavailable(t *testing.T, client *ClientSet) {
 	resources := getTestingResources()
 
-	errChan := make(chan error)
+	failed := atomicFailure{}
+	var wg sync.WaitGroup
 	for _, resource := range resources {
-		go inner(errChan, client, resource)
+		wg.Add(1)
+		go func(resource TestingResource) {
+			if IsResourceUnavailable(t, client, resource) {
+				failed.setFailed()
+			}
+		}(resource)
 	}
-	checkErr := <-errChan
-
-	return checkErr
+	wg.Wait()
+	if failed.getFailed() {
+		t.Fatalf("One or more console resources did not stay missing for at least 30s.")
+	}
 }
 
-// IsResourceUnavailable checks if tested resource is unavailable during a 15 second period.
-// If the resource exists during that time, an error will be returned.
-func IsResourceUnavailable(errChan chan error, client *ClientSet, resource TestingResource) {
-	counter := 0
-	maxCount := 15
-	err := wait.Poll(1*time.Second, AsyncOperationTimeout, func() (stop bool, err error) {
-
-		obtainedResource, err := GetResource(client, resource)
+// IsResourceUnavailable indicates whether the console resource goes missing and
+// stays that way for at least 30s. Once a resource is missing, it should not
+// reappear.
+func IsResourceUnavailable(t *testing.T, client *ClientSet, resource TestingResource) bool {
+	startTime := time.Now()
+	minimumDuration := time.Second * 30
+	err := wait.PollImmediate(1*time.Second, AsyncOperationTimeout, func() (stop bool, err error) {
+		_, err = GetResource(client, resource)
 		if err == nil {
-
-			yamlBytes, err := yaml.Marshal(obtainedResource)
-			if err != nil {
-				fmt.Printf("error marshalling yaml for %s %s %v", resource.kind, resource.name, err)
-			}
-
-			return true, fmt.Errorf("deleted console %s %s was recreated: %#v", resource.kind, resource.name, string(yamlBytes))
+			// Resource exists. Reset timer and keep waiting.
+			startTime = time.Now()
+			t.Logf("Console %s %s exists", resource.kind, resource.name)
+			return false, nil
 		}
 		if !errors.IsNotFound(err) {
-			return true, err
+			// Unable to retrieve resource due to error. Reset timer and keep waiting.
+			startTime = time.Now()
+			t.Errorf("Error checking that console %s %s exists: %v", resource.kind, resource.name, err)
+			return false, nil
 		}
-		counter++
-		if counter == maxCount {
-			return true, nil
-		}
-		return false, nil
+		// Resource is missing. Exit if the minimum duration has elapsed.
+		minimumDurationElapsed := startTime.Add(minimumDuration).Before(time.Now())
+		return minimumDurationElapsed, nil
 	})
-	errChan <- err
+	if err != nil {
+		t.Errorf("timed out waiting for console %s %s to be missing for at least %v", resource.kind, resource.name, minimumDuration)
+	}
+	return err == nil
 }

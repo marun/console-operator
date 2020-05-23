@@ -25,8 +25,5 @@ func TestRemoved(t *testing.T) {
 
 	framework.MustRemoveConsole(t, client)
 	t.Logf("validating that the operator does not recreate removed resources when ManagementState:Removed...")
-	err := framework.ConsoleResourcesUnavailable(client)
-	if err != nil {
-		t.Fatal(err)
-	}
+	framework.CheckConsoleResourcesUnavailable(t, client)
 }

@@ -26,10 +26,7 @@ func TestUnmanaged(t *testing.T) {
 
 	framework.DeleteAll(t, client)
 	t.Logf("validating that the operator does not recreate deleted resources when ManagementState:Unmanaged...")
-	err := framework.ConsoleResourcesUnavailable(client)
-	if err != nil {
-		t.Fatal(err)
-	}
+	framework.CheckConsoleResourcesUnavailable(t, client)
 }
 
 func TestEditUnmanagedConfigMap(t *testing.T) {

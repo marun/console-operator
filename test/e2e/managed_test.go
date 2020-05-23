@@ -25,10 +25,7 @@ func TestManaged(t *testing.T) {
 	framework.DeleteAll(t, client)
 
 	t.Logf("validating that the operator recreates resources when ManagementState:Managed...")
-	err := framework.ConsoleResourcesAvailable(client)
-	if err != nil {
-		t.Fatal(err)
-	}
+	framework.CheckConsoleResourcesAvailable(t, client)
 }
 
 func TestEditManagedConfigMap(t *testing.T) {
